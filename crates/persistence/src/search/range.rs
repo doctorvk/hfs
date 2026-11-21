@@ -170,11 +170,11 @@ impl QuantityIntervalPredicate {
 ///
 /// | prefix | condition on `[L, H]` |
 /// |---|---|
-/// | `eq` | `s ≤ L ∧ H < e` (`[s, e)` = implicit range) |
+/// | `eq` | `s ≤ L < e ∧ s ≤ H < e` (`[s, e)` = implicit range) |
 /// | `ne` | `L < s ∨ H ≥ e` |
 /// | `gt` / `ge` | `H > v` / `H ≥ v` |
 /// | `lt` / `le` | `L < v` / `L ≤ v` |
-/// | `sa` / `eb` | `L > v` / `H < v` |
+/// | `sa` / `eb` | `L > v` / `H < v ∧ L < v` |
 /// | `ap` | `L ≤ v+m ∧ H ≥ v−m` |
 pub fn quantity_interval_predicate(
     prefix: SearchPrefix,
@@ -185,7 +185,15 @@ pub fn quantity_interval_predicate(
     let any_of = match prefix {
         SearchPrefix::Eq => {
             let (s, e) = implicit_range(value, num_str);
-            vec![vec![Low(Cmp::Ge, s), High(Cmp::Lt, e)]]
+            // L <= H on every stored row, so H < e implies L < e and L >= s
+            // implies H >= s. Stating them gives each value index a two-sided
+            // range without changing the matched rows.
+            vec![vec![
+                Low(Cmp::Ge, s),
+                Low(Cmp::Lt, e),
+                High(Cmp::Ge, s),
+                High(Cmp::Lt, e),
+            ]]
         }
         SearchPrefix::Ne => {
             let (s, e) = implicit_range(value, num_str);
@@ -196,7 +204,7 @@ pub fn quantity_interval_predicate(
         SearchPrefix::Lt => vec![vec![Low(Cmp::Lt, value)]],
         SearchPrefix::Le => vec![vec![Low(Cmp::Le, value)]],
         SearchPrefix::Sa => vec![vec![Low(Cmp::Gt, value)]],
-        SearchPrefix::Eb => vec![vec![High(Cmp::Lt, value)]],
+        SearchPrefix::Eb => vec![vec![High(Cmp::Lt, value), Low(Cmp::Lt, value)]],
         SearchPrefix::Ap => {
             let (lo, hi) = approx_range(value, num_str);
             vec![vec![Low(Cmp::Le, hi), High(Cmp::Ge, lo)]]
@@ -459,6 +467,25 @@ mod tests {
         // open low: (-∞, 10]
         assert!(p(SearchPrefix::Lt, -1000.0).matches(QUANTITY_OPEN_LOW, 10.0));
         assert!(p(SearchPrefix::Eb, 20.0).matches(QUANTITY_OPEN_LOW, 10.0));
+    }
+
+    #[test]
+    fn interval_predicate_states_implied_bounds() {
+        use QuantityBound::{High, Low};
+        let (s, e) = implicit_range(45.0, "45");
+        assert_eq!(
+            quantity_interval_predicate(SearchPrefix::Eq, 45.0, "45").any_of,
+            vec![vec![
+                Low(Cmp::Ge, s),
+                Low(Cmp::Lt, e),
+                High(Cmp::Ge, s),
+                High(Cmp::Lt, e),
+            ]]
+        );
+        assert_eq!(
+            quantity_interval_predicate(SearchPrefix::Eb, 45.0, "45").any_of,
+            vec![vec![High(Cmp::Lt, 45.0), Low(Cmp::Lt, 45.0)]]
+        );
     }
 
     #[test]

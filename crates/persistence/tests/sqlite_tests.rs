@@ -5957,3 +5957,139 @@ async fn sqlite_quantity_range_becomes_searchable_after_reindex() {
 
     quantity_range_suite::check_searches(backend.as_ref(), &tenant).await;
 }
+
+/// #2730: `eq` states both bounds on both ends of the stored interval, so the
+/// filter the SQLite builder generates seeks a quantity index with a two-sided
+/// range on one quantity column. A `system|code` search ORs a raw and a
+/// canonical arm, which SQLite reads as a MULTI-INDEX OR, so each arm is
+/// checked on its own SEARCH line.
+#[tokio::test]
+async fn sqlite_quantity_eq_seeks_a_two_sided_quantity_range() {
+    use helios_persistence::backends::sqlite::search::{QueryBuilder, SqlParam};
+    use rusqlite::types::Value;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("quantity-eq-2730.db");
+    let config = SqliteBackendConfig {
+        data_dir: Some(spec_data_dir()),
+        ..Default::default()
+    };
+    let backend = SqliteBackend::with_config(&path, config).unwrap();
+    backend.init_schema().unwrap();
+    let tenant = create_tenant("quantity-eq-2730");
+    let tenant_id = tenant.tenant_id().as_str();
+
+    // 500 kg stored once in kg and once as 500000 g, among decoys in both
+    // units that match neither search. The writer fills the canonical columns.
+    let mut stored = vec![(500.0, "kg"), (500_000.0, "g")];
+    for unit in ["kg", "g"] {
+        stored.extend((0..40).map(|n| (f64::from(n) * 20.0 + 1.0, unit)));
+    }
+    for (n, (value, unit)) in stored.iter().enumerate() {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": format!("q2730-{n}"),
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "29463-7"}]},
+                    "valueQuantity": {
+                        "value": value,
+                        "unit": unit,
+                        "system": "http://unitsofmeasure.org",
+                        "code": unit
+                    }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    for (value, expected, canonical) in [
+        ("500", 1, false),
+        ("500|http://unitsofmeasure.org|kg", 2, true),
+    ] {
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "value-quantity".to_string(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        });
+        // Positive control: the rows the plan is read against are found, the
+        // one in g only through the canonical arm.
+        let found = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(found.resources.items.len(), expected, "{value}");
+
+        // The search's own filter, as the page statement embeds it: `?1` and
+        // `?2` are the tenant and type, the condition's binds follow.
+        let filter = QueryBuilder::new(tenant_id, "Observation")
+            .with_param_offset(2)
+            .build(&query)
+            .unwrap();
+        assert_eq!(
+            filter.sql.contains("value_quantity_canonical_unit = ?"),
+            canonical,
+            "{value}: {}",
+            filter.sql
+        );
+        let mut binds = vec![
+            Value::Text(tenant_id.to_string()),
+            Value::Text("Observation".to_string()),
+        ];
+        binds.extend(filter.params.iter().map(|param| match param {
+            SqlParam::String(text) => Value::Text(text.clone()),
+            SqlParam::Integer(int) => Value::Integer(*int),
+            SqlParam::Float(float) => Value::Real(*float),
+            SqlParam::Null => Value::Null,
+        }));
+        let sql = format!(
+            "EXPLAIN QUERY PLAN SELECT id FROM resources \
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 AND rowid IN ({})",
+            filter.sql
+        );
+        let plan = conn
+            .prepare(&sql)
+            .unwrap()
+            .query_map(rusqlite::params_from_iter(binds), |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        eprintln!("{value}: {}", plan.join(" | "));
+
+        // One SEARCH line on a quantity index with `>?` and `<?` on `col`
+        // (SQLite prints `>=` as `>` and `<=` as `<`), and `extra` too.
+        let seeks = |cols: &[&str], extra: &str| {
+            plan.iter().any(|line| {
+                line.starts_with("SEARCH search_index USING ")
+                    && line.contains("INDEX idx_search_quantity")
+                    && line.contains(extra)
+                    && cols.iter().any(|col| {
+                        line.contains(&format!("{col}>?")) && line.contains(&format!("{col}<?"))
+                    })
+            })
+        };
+        assert!(
+            seeks(&["value_quantity_value", "value_quantity_high"], ""),
+            "{value}: the raw arm must seek a two-sided quantity range: {plan:?}"
+        );
+        if canonical {
+            assert!(
+                seeks(
+                    &[
+                        "value_quantity_canonical_value",
+                        "value_quantity_canonical_high"
+                    ],
+                    "value_quantity_canonical_unit=?"
+                ),
+                "{value}: the canonical arm must seek a two-sided canonical range \
+                 under its unit: {plan:?}"
+            );
+        }
+    }
+}

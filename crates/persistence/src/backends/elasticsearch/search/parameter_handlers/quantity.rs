@@ -234,16 +234,26 @@ mod tests {
     }
 
     /// `eq` is the implicit-precision window `[s, e)` of the value as written,
-    /// now against the interval: `s ≤ L ∧ H < e`.
+    /// now against the interval: `s ≤ L < e ∧ s ≤ H < e` (#2730 states the
+    /// bounds `L ≤ H` implies, so each end is bounded on both sides).
     #[test]
     fn eq_keeps_text_precision_range() {
+        let low_field = "search_params.quantity.value";
+        let high_field = "search_params.quantity.high";
+        let (s, e) = crate::search::implicit_range(60.0, "60.0");
+        assert!((s - 59.95).abs() < 1e-9 && (e - 60.05).abs() < 1e-9);
         let clause = build_clause("value-quantity", "60.0", SearchPrefix::Eq).unwrap();
-        let low = find_range(&clause, "search_params.quantity.value")
-            .expect("low-end range clause must be present");
-        assert!((low["gte"].as_f64().unwrap() - 59.95).abs() < 1e-9);
-        let high = find_high_range(&clause, "search_params.quantity.high")
-            .expect("high-end range clause must be present");
-        assert!((high["lt"].as_f64().unwrap() - 60.05).abs() < 1e-9);
+        let group = &clause["nested"]["query"]["bool"]["must"][1]["bool"]["must"];
+        assert_eq!(group[0], json!({ "range": { low_field: { "gte": s } } }));
+        assert_eq!(group[1], json!({ "range": { low_field: { "lt": e } } }));
+        assert_eq!(
+            group[2]["bool"]["should"][0],
+            json!({ "range": { high_field: { "gte": s } } })
+        );
+        assert_eq!(
+            group[3]["bool"]["should"][0],
+            json!({ "range": { high_field: { "lt": e } } })
+        );
     }
 
     /// `ne` is the complement: `L < s ∨ H ≥ e`, two alternatives.
@@ -317,13 +327,7 @@ mod tests {
     fn comparators_read_the_matching_end_with_a_fallback() {
         let high_field = "search_params.quantity.high";
         let low_field = "search_params.quantity.value";
-        for (prefix, op) in [
-            (SearchPrefix::Gt, "gt"),
-            (SearchPrefix::Ge, "gte"),
-            (SearchPrefix::Eb, "lt"),
-        ] {
-            let clause = build_clause("onset-age", "45", prefix).unwrap();
-            let should = &clause["nested"]["query"]["bool"]["must"][1]["bool"];
+        let assert_high_with_fallback = |should: &Value, op: &str| {
             assert_eq!(should["should"][0]["range"][high_field][op], json!(45.0));
             let fallback = &should["should"][1]["bool"];
             assert_eq!(fallback["must"][0]["range"][low_field][op], json!(45.0));
@@ -331,7 +335,17 @@ mod tests {
                 fallback["must_not"][0],
                 json!({ "exists": { "field": high_field } })
             );
+        };
+        for (prefix, op) in [(SearchPrefix::Gt, "gt"), (SearchPrefix::Ge, "gte")] {
+            let clause = build_clause("onset-age", "45", prefix).unwrap();
+            let should = &clause["nested"]["query"]["bool"]["must"][1]["bool"];
+            assert_high_with_fallback(should, op);
         }
+        // `eb` also states the low bound `H < v` implies (#2730).
+        let clause = build_clause("onset-age", "45", SearchPrefix::Eb).unwrap();
+        let group = &clause["nested"]["query"]["bool"]["must"][1]["bool"]["must"];
+        assert_high_with_fallback(&group[0]["bool"], "lt");
+        assert_eq!(group[1], json!({ "range": { low_field: { "lt": 45.0 } } }));
         for (prefix, op) in [
             (SearchPrefix::Lt, "lt"),
             (SearchPrefix::Le, "lte"),
@@ -343,6 +357,88 @@ mod tests {
                 json!({ "range": { low_field: { op: 45.0 } } }),
                 "{prefix:?}"
             );
+        }
+    }
+
+    /// Evaluates a generated query against one nested quantity row, for the
+    /// clause kinds `build_clause` emits. An absent field fails a `range`.
+    fn eval(query: &Value, row: &Value) -> bool {
+        if let Some(nested) = query.get("nested") {
+            return eval(&nested["query"], row);
+        }
+        if let Some(b) = query.get("bool") {
+            let must = b["must"]
+                .as_array()
+                .is_none_or(|qs| qs.iter().all(|q| eval(q, row)));
+            let must_not = b["must_not"]
+                .as_array()
+                .is_none_or(|qs| qs.iter().all(|q| !eval(q, row)));
+            let should = b["should"]
+                .as_array()
+                .is_none_or(|qs| qs.iter().any(|q| eval(q, row)));
+            return must && must_not && should;
+        }
+        if let Some(term) = query.get("term").and_then(Value::as_object) {
+            return term.iter().all(|(field, v)| row.get(field) == Some(v));
+        }
+        if let Some(range) = query.get("range").and_then(Value::as_object) {
+            return range.iter().all(|(field, ops)| {
+                let Some(stored) = row.get(field).and_then(Value::as_f64) else {
+                    return false;
+                };
+                ops.as_object().unwrap().iter().all(|(op, bound)| {
+                    let bound = bound.as_f64().unwrap();
+                    match op.as_str() {
+                        "lt" => stored < bound,
+                        "lte" => stored <= bound,
+                        "gt" => stored > bound,
+                        "gte" => stored >= bound,
+                        other => panic!("{other}"),
+                    }
+                })
+            });
+        }
+        if let Some(exists) = query.get("exists") {
+            return row.get(exists["field"].as_str().unwrap()).is_some();
+        }
+        panic!("unexpected clause {query}");
+    }
+
+    /// #2730: a row indexed before schema version 4 has no `high` (nor
+    /// `canonical_high`). With the implied bounds stated, `eq` and `eb` still
+    /// match it exactly when its value matches the point rule, as before.
+    #[test]
+    fn legacy_rows_without_high_keep_their_eq_and_eb_results() {
+        let (s, e) = crate::search::implicit_range(60.0, "60");
+        for x in [59.0, 59.4, 59.5, 60.0, 60.49, 60.5, 61.0] {
+            let row = json!({
+                "search_params.quantity.name": "value-quantity",
+                "search_params.quantity.value": x,
+                "search_params.quantity.code": "kg",
+            });
+            let eq = build_clause("value-quantity", "60|kg", SearchPrefix::Eq).unwrap();
+            assert_eq!(eval(&eq, &row), s <= x && x < e, "eq60 raw x={x}");
+            let eb = build_clause("value-quantity", "60|kg", SearchPrefix::Eb).unwrap();
+            assert_eq!(eval(&eb, &row), x < 60.0, "eb60 raw x={x}");
+
+            // Stored in grams, searched in kilograms: only the canonical
+            // branch can match, and the row has no `canonical_high`. Its
+            // canonical value goes through the same conversion as the bounds,
+            // so the boundary cases stay exact.
+            let (canonical, unit) =
+                helios_fhirpath::ucum::canonicalize_quantity(x, "kg").unwrap();
+            let row = json!({
+                "search_params.quantity.name": "value-quantity",
+                "search_params.quantity.value": x * 1000.0,
+                "search_params.quantity.code": "g",
+                "search_params.quantity.canonical_value": canonical,
+                "search_params.quantity.canonical_unit": unit,
+            });
+            let ucum = "60|http://unitsofmeasure.org|kg";
+            let eq = build_clause("value-quantity", ucum, SearchPrefix::Eq).unwrap();
+            assert_eq!(eval(&eq, &row), s <= x && x < e, "eq60 canonical x={x}");
+            let eb = build_clause("value-quantity", ucum, SearchPrefix::Eb).unwrap();
+            assert_eq!(eval(&eb, &row), x < 60.0, "eb60 canonical x={x}");
         }
     }
 

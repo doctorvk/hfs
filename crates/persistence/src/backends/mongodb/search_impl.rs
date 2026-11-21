@@ -132,6 +132,9 @@ const VALUE_DATE_END: &str = "value_date_end";
 /// Upper end of a quantity row's closed interval (#2602); the lower end is
 /// `value_quantity_value`.
 const VALUE_QUANTITY_HIGH: &str = "value_quantity_high";
+/// Lower end of a quantity row's closed interval (#2602). Both quantity
+/// indexes are partial on this field existing (`search_index_catalog.rs`).
+const VALUE_QUANTITY_LOW: &str = "value_quantity_value";
 
 /// Reads a date search value with the grammar every backend shares.
 ///
@@ -6523,7 +6526,7 @@ impl MongoBackend {
             let mut doc = Document::new();
             for bound in group {
                 let (field, cmp, v) = match *bound {
-                    QuantityBound::Low(c, v) => ("value_quantity_value", c, v),
+                    QuantityBound::Low(c, v) => (VALUE_QUANTITY_LOW, c, v),
                     QuantityBound::High(c, v) => (VALUE_QUANTITY_HIGH, c, v),
                 };
                 let op = match cmp {
@@ -6540,6 +6543,12 @@ impl MongoBackend {
                         doc.insert(field, doc! { op: v });
                     }
                 }
+            }
+            // A group with no low bound must still say the low field exists,
+            // or MongoDB cannot use the partial quantity indexes. Every valid
+            // quantity row has a non-null low endpoint, so results are unchanged.
+            if !group.iter().any(|b| matches!(b, QuantityBound::Low(..))) {
+                doc.insert(VALUE_QUANTITY_LOW, doc! { "$ne": Bson::Null });
             }
             doc
         };
@@ -7851,6 +7860,10 @@ mod date_filter_tests {
                         low
                     };
                     cond.as_document().unwrap().iter().all(|(op, v)| {
+                        // The low-field guard; every row here has a low end.
+                        if op.as_str() == "$ne" && matches!(v, Bson::Null) {
+                            return true;
+                        }
                         let v = v.as_f64().unwrap();
                         match op.as_str() {
                             "$lt" => stored < v,
@@ -8021,7 +8034,64 @@ mod date_filter_tests {
             filter.get_document("value_quantity_high").unwrap(),
             &doc! { "$gt": 5.4 }
         );
-        assert!(!filter.contains_key("value_quantity_value"));
+        // No low bound, so the low field carries the guard that makes the
+        // partial quantity indexes usable (#2730).
+        assert_eq!(
+            filter.get_document("value_quantity_value").unwrap(),
+            &doc! { "$ne": Bson::Null }
+        );
+    }
+
+    /// #2730: the rendered filters state the bounds each quantity index needs.
+    /// `eq` bounds both fields on both sides, `eb` both fields from above,
+    /// and every group without a low bound guards the low field.
+    #[test]
+    fn quantity_filter_keeps_quantity_indexes_usable() {
+        let backend =
+            MongoBackend::new(crate::backends::mongodb::MongoBackendConfig::default()).unwrap();
+        let filter = |raw: &str| {
+            backend
+                .build_quantity_filter("onset-age", &SearchValue::parse(raw))
+                .unwrap()
+        };
+        let guard = doc! { "$ne": Bson::Null };
+
+        let (s, e) = crate::search::implicit_range(45.0, "45");
+        assert_eq!(
+            filter("eq45"),
+            doc! {
+                "value_quantity_value": { "$gte": s, "$lt": e },
+                "value_quantity_high": { "$gte": s, "$lt": e },
+            }
+        );
+        assert_eq!(
+            filter("gt45"),
+            doc! {
+                "value_quantity_high": { "$gt": 45.0 },
+                "value_quantity_value": guard.clone(),
+            }
+        );
+        assert_eq!(
+            filter("ge45"),
+            doc! {
+                "value_quantity_high": { "$gte": 45.0 },
+                "value_quantity_value": guard.clone(),
+            }
+        );
+        assert_eq!(
+            filter("eb45"),
+            doc! {
+                "value_quantity_high": { "$lt": 45.0 },
+                "value_quantity_value": { "$lt": 45.0 },
+            }
+        );
+        assert_eq!(
+            filter("ne45"),
+            doc! { "$or": [
+                { "value_quantity_value": { "$lt": s } },
+                { "value_quantity_high": { "$gte": e }, "value_quantity_value": guard },
+            ] }
+        );
     }
 }
 

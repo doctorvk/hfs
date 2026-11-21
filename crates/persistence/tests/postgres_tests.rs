@@ -35589,6 +35589,184 @@ mod postgres_integration {
                 "{predicate}: expected idx_search_quantity_high: {text}"
             );
         }
+
+        // #2730: `eq` states both bounds on both ends (`eq500` is `[499.5,
+        // 500.5)`), so whichever quantity index serves the generated search
+        // bounds one quantity column on both sides in its `Index Cond`.
+        let (from, binds) = onset_age_search(tenant_id, "500");
+        let binds: Vec<_> = binds
+            .iter()
+            .map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let count: i64 = client
+            .query_one(&format!("SELECT count(*) {from}"), &binds)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(count, 40, "eq500: one value of the 1000 in 40000 rows");
+        let plan: serde_json::Value = client
+            .query_one(&format!("EXPLAIN (FORMAT JSON) SELECT id {from}"), &binds)
+            .await
+            .unwrap()
+            .get(0);
+        let mut scans = Vec::new();
+        quantity_index_scans(&plan, &mut scans);
+        assert!(
+            scans.iter().any(|(index, cond)| {
+                index.starts_with("idx_search_quantity")
+                    && ["value_quantity_value", "value_quantity_high"]
+                        .iter()
+                        .any(|col| bounds_both_sides(cond, col))
+            }),
+            "eq: expected a two-sided Index Cond on one quantity column: {plan}"
+        );
+    }
+
+    /// #2730: the canonical arm of a `system|code` `eq` search bounds one
+    /// canonical quantity column on both sides under the canonical-unit
+    /// equality, so `idx_search_quantity_canonical` (or its `_high` sibling)
+    /// seeks a two-sided range. Every row is stored in `g` and searched in
+    /// `kg`, so only the canonical arm can match.
+    #[tokio::test]
+    async fn postgres_integration_quantity_eq_canonical_arm_is_two_sided() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("quantity-canonical-explain");
+        let tenant_id = tenant.tenant_id().as_str();
+        let client = backend.get_client().await.unwrap();
+        client.execute(
+            "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted)
+             SELECT $1, 'Condition', 'qc-' || series, '1',
+                    jsonb_build_object('resourceType', 'Condition', 'id', 'qc-' || series),
+                    '2020-01-01T00:00:00Z', FALSE FROM generate_series(1, 40000) series",
+            &[&tenant_id],
+        ).await.unwrap();
+        // The canonical columns as the writer fills them for a point in `g`:
+        // the UCUM-canonical value at both ends and the canonical unit. `g`
+        // has no offset, so the canonical value is the stored one times the
+        // factor.
+        let (factor, canonical_unit) =
+            helios_fhirpath::ucum::canonicalize_quantity(1.0, "g").expect("g is UCUM");
+        client
+            .execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+             value_quantity_value, value_quantity_high, value_quantity_unit,
+             value_quantity_system, value_quantity_canonical_value,
+             value_quantity_canonical_high, value_quantity_canonical_unit, last_updated)
+             SELECT $1, 'Condition', 'qc-' || series, 'onset-age',
+                    grams, grams, 'g', 'http://unitsofmeasure.org',
+                    grams * $2::float8, grams * $2::float8, $3::text,
+                    '2020-01-01T00:00:00Z'
+             FROM generate_series(1, 40000) series,
+                  LATERAL (SELECT ((series % 1000) * 1000)::float8 AS grams) g",
+                &[&tenant_id, &factor, &canonical_unit],
+            )
+            .await
+            .unwrap();
+        client.batch_execute("ANALYZE search_index").await.unwrap();
+
+        // `eq500` kg is `[499.5, 500.5)` kg: 500,000 g, one value in 1000.
+        let (from, binds) = onset_age_search(tenant_id, "500|http://unitsofmeasure.org|kg");
+        let binds: Vec<_> = binds
+            .iter()
+            .map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        assert!(
+            from.contains("value_quantity_canonical_unit = $"),
+            "the search must carry a canonical arm: {from}"
+        );
+        let count: i64 = client
+            .query_one(&format!("SELECT count(*) {from}"), &binds)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(count, 40, "only the canonical arm matches the rows in g");
+        let plan: serde_json::Value = client
+            .query_one(&format!("EXPLAIN (FORMAT JSON) SELECT id {from}"), &binds)
+            .await
+            .unwrap()
+            .get(0);
+        let mut scans = Vec::new();
+        quantity_index_scans(&plan, &mut scans);
+        assert!(
+            scans.iter().any(|(index, cond)| {
+                matches!(
+                    index.as_str(),
+                    "idx_search_quantity_canonical" | "idx_search_quantity_canonical_high"
+                ) && cond.contains("value_quantity_canonical_unit = ")
+                    && [
+                        "value_quantity_canonical_value",
+                        "value_quantity_canonical_high",
+                    ]
+                    .iter()
+                    .any(|col| bounds_both_sides(cond, col))
+            }),
+            "canonical eq: expected a two-sided canonical Index Cond under the unit: {plan}"
+        );
+    }
+
+    /// The `FROM resources WHERE …` of the Condition search the production
+    /// builder generates for `onset-age=<value>`, with its binds in order:
+    /// `$1`/`$2` are the tenant and type, as the search binds them.
+    fn onset_age_search(
+        tenant_id: &str,
+        value: &str,
+    ) -> (String, Vec<Box<dyn tokio_postgres::types::ToSql + Sync>>) {
+        use helios_persistence::backends::postgres::search::query_builder::{
+            PostgresQueryBuilder, SqlParam,
+        };
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+        let query = SearchQuery::new("Condition").with_parameter(SearchParameter {
+            name: "onset-age".to_string(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        });
+        let filter = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect("the query builds")
+            .expect("a quantity search has a condition");
+        let mut binds: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new("Condition".to_string()),
+        ];
+        for param in &filter.params {
+            match param {
+                SqlParam::Float(value) => binds.push(Box::new(*value)),
+                SqlParam::Text(value) => binds.push(Box::new(value.clone())),
+                other => panic!("unexpected quantity bind {other:?}"),
+            }
+        }
+        let from = format!(
+            "FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE AND {}",
+            filter.sql
+        );
+        (from, binds)
+    }
+
+    /// Every `(Index Name, Index Cond)` of a JSON plan.
+    fn quantity_index_scans(plan: &serde_json::Value, out: &mut Vec<(String, String)>) {
+        match plan {
+            serde_json::Value::Object(fields) => {
+                let name = fields.get("Index Name").and_then(|v| v.as_str());
+                let cond = fields.get("Index Cond").and_then(|v| v.as_str());
+                if let (Some(name), Some(cond)) = (name, cond) {
+                    out.push((name.to_string(), cond.to_string()));
+                }
+                fields.values().for_each(|v| quantity_index_scans(v, out));
+            }
+            serde_json::Value::Array(values) => {
+                values.iter().for_each(|v| quantity_index_scans(v, out))
+            }
+            _ => {}
+        }
+    }
+
+    /// `cond` bounds `col` from below (`>=`) and above (`<`).
+    fn bounds_both_sides(cond: &str, col: &str) -> bool {
+        cond.contains(&format!("{col} >= ")) && cond.contains(&format!("{col} < "))
     }
 
     /// #2602: a `Range` was not indexed for quantity parameters. It is one
